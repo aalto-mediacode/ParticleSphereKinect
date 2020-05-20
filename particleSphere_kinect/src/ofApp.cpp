@@ -3,16 +3,20 @@
 //--------------------------------------------------------------
 void ofApp::setup(){
     
-    bgColor = ofColor(40,20,20,100);
+    ofSetFrameRate(30);
+    bgColor = ofColor(35,15,15,120);
     ofBackground(bgColor);
     ofSetBackgroundAuto(false);
+    
+    MODE = 2;
     
     //--- SETUP KINECT
     ofSetLogLevel(OF_LOG_VERBOSE);
     kinect.setRegistration(true); // enable depth->video image calibration
     kinect.init(false, false); // disable video image (faster fps)
     kinect.open();  // opens first available kinect
-    kinect.setDepthClipping(500, 1200); // sensing only between 50 and 120 cm from the sensor
+    kinect.setCameraTiltAngle(4);
+    kinect.setDepthClipping(500, 1000); // NOTE: sensing only between 50 and 100 cm from the sensor
     
     if(kinect.isConnected()) {
         ofLogNotice() << "sensor-emitter dist: " << kinect.getSensorEmitterDistance() << "cm";
@@ -24,8 +28,8 @@ void ofApp::setup(){
     grayImage.allocate(kinect.width, kinect.height);
     grayThreshNear.allocate(kinect.width, kinect.height);
     grayThreshFar.allocate(kinect.width, kinect.height);
-    nearThreshold = 230;
-    farThreshold = 180;
+    nearThreshold = 255;
+    farThreshold = 100;
     bThreshWithOpenCV = true;
     
     
@@ -36,27 +40,24 @@ void ofApp::setup(){
     fbo.end();
     
     center = {0.0, 0.0, 0.0};
-    sphere.setResolution(20);
-    sphere.setPosition(center);
-    sphere.setRadius(300);
-
+    
     G = 1;
     GOut = 1;
+    maxG = 1100; // edit this for changing the magnitude of gravitation
     
-    MODE = 1;
-
+    angle = 1;
+    inc = 0.1;
+    
     // Create particles
-    numPoints = 800;
-    for (int i=0; i<numPoints; i++){
+    for (int i=0; i<NUMPOINTS; i++){
         particles.push_back(particle);
         particles[i].setup();
     }
-
 }
 
 //--------------------------------------------------------------
 void ofApp::update(){
-
+    
     //---GET DATA FROM KINECT
     kinect.update();
     
@@ -64,8 +65,7 @@ void ofApp::update(){
     if(kinect.isFrameNew()) {
         grayImage.setFromPixels(kinect.getDepthPixels());  // load grayscale depth image from the kinect
         
-        // THRESHOLDS
-        // two thresholds - one for the far plane and one for the near plane
+        // two thresholds: one for the far plane and one for the near plane
         // cvAnd gets the pixels which are a union of the two thresholds
         if(bThreshWithOpenCV) {
             grayThreshNear = grayImage;
@@ -73,18 +73,8 @@ void ofApp::update(){
             grayThreshNear.threshold(nearThreshold, true);
             grayThreshFar.threshold(farThreshold);
             cvAnd(grayThreshNear.getCvImage(), grayThreshFar.getCvImage(), grayImage.getCvImage(), NULL);
-        } else {
-            // or we do it ourselves - work manually with the pixels
-            ofPixels & pix = grayImage.getPixels();
-            int numPixels = pix.size();
-            for(int i = 0; i < numPixels; i++) {
-                if(pix[i] < nearThreshold && pix[i] > farThreshold) {
-                    pix[i] = 255;
-                } else {
-                    pix[i] = 0;
-                }
-            }
         }
+        
         // some effects to fight depth camera noise
         grayImage.dilate();
         grayImage.blurGaussian(3);
@@ -93,11 +83,12 @@ void ofApp::update(){
         // update the cv image
         grayImage.flagImageChanged();
         
-        // detect contour areas between 40 pixels and 1/2 screen size. Find max 2 blobs(hands), not detecting holes
-        contourFinder.findContours(grayImage, 40, kinect.width * kinect.height /2, 2, false);
+        // detect contour areas between 100 pixels and 1/2 screen size. Find max 2 blobs(hands), not detecting holes
+        contourFinder.findContours(grayImage, 100, kinect.width * kinect.height /2, 2, false);
     }
     
-    //---BLOB DETECTION
+    
+    //---BLOB DETECTION & MAPPING
     vector<ofxCvBlob>& blobs = contourFinder.blobs;
     int numBlobs = contourFinder.nBlobs;
     ofLog() << "Number of blobs detected " << numBlobs;
@@ -108,115 +99,113 @@ void ofApp::update(){
         float dist = distance(blobCentroid1, blobCentroid2);
         ofLog() << "Distance between blobs " << dist;
         
-        //G = ofMap(dist, 100, 400, 1000, 0);
-        //GOut = ofMap(dist, 400, 100, 1000, 0);
+        // Map distance between hands to gravitational pull
+        G = ofMap(dist, 80, 400, maxG, 0);
+        GOut = ofMap(dist, 400, 80, maxG, 0);
     }
     
-    G = ofMap(mouseX, 0, ofGetWidth(), 800, 0);
-    GOut = ofMap(mouseY, 0, ofGetHeight(), 800, 0);
+    // Uncomment this for testing with mouse instead of kinect
+    //G = ofMap(mouseX, 0, ofGetWidth(), maxG, 0);
+    //GOut = ofMap(mouseY, 0, ofGetHeight(), maxG, 0);
+    
     
     //---DRAW PARTICLES IN FBO
     fbo.begin();
     ofClear(0);
     ofBackground(bgColor);
+    
+    // Settings for camera rotation
+    easyCam.setGlobalPosition(0, 0, -600);
+    glm::vec3 axis = {-0.5, 1, 0};
+    angle += inc;
+    easyCam.rotateAroundDeg(angle, axis, center);
+    easyCam.setTarget(center);
     easyCam.begin();
-
-    // Calculate one particle's distance to center (we don't need the distances from all of them)
+    
+    // Calculate one particle's distance to center (saving memory here, don't need the distances from all of them)
     distC = distance(particles[0].pos, center);
     ofLog() << "Particle dist from center " << distC;
     
-    // Calculate particles' distances to each other
+    // Slow camera rotation when particles are farther away from center
+    if (distC > 240){
+        inc = 0.08;
+    }else{
+        inc = 0.15;
+    }
+    
     for(int i=0; i<particles.size(); i++){
+        particles[i].addNoise(i, distC);
+        particles[i].attractedTo(particles[i].origin, GOut);
+        if(distC > 70){ // Stop attracting to center when 70px away from it
+            particles[i].attractedTo(center, G);
+        }
+        
+        // Calculate particles' distances to each other & draw a line between close ones
         float distXY, distYZ;
         for(int j=i+1; j<particles.size(); j++){
             distXY = ofDist(particles[i].pos.x, particles[i].pos.y, particles[j].pos.x, particles[j].pos.y);
             distYZ = ofDist(particles[i].pos.z, particles[i].pos.y, particles[j].pos.z, particles[j].pos.y);
-            
-            if(distXY <18 && distYZ < 18 && distC > 240){
+            if(distXY < 18 && distYZ < 18 && distC > 240){
                 particles[i].isClose = true;
-                ofSetColor(255, 120);
+                int lineOpacity = ofMap(distC, 240, 280, 0, 127, true);
+                ofSetColor(255, lineOpacity);
                 ofSetLineWidth(1);
                 ofDrawLine(particles[i].pos, particles[j].pos);
                 break; // if a close particle found, terminate loop
             }else{
-                 particles[i].isClose = false;
+                particles[i].isClose = false;
             }
         }
-        
-        //particles[i].update(i);
-        //particles[i].revolve(i, distC);
-        
-        particles[i].addNoise(i, distC);
-        if(distC > 70){
-            particles[i].attractedTo(center, G);
-        }
-        particles[i].attractedTo(particles[i].origin, GOut);
-        particles[i].draw(i, MODE);
+        particles[i].draw(i);
     }
     easyCam.end();
+    
+    
+    //---DRAW FROM KINECT
+    //MODE 1: Draw small kinect image in upper left corner
+    if(MODE == 1){
+        ofSetColor(255);
+        grayImage.draw(640/3, 0, -640/3, 480/3);
+        
+        //MODE 2: Draw blobs in fullscreen size as a polyline overlay
+    }else if(MODE == 2){
+        kinectPolylines.clear();
+        for(int i=0; i<numBlobs; i++) {
+            vector<glm::vec3> pts = blobs[i].pts;
+            ofPolyline polyline;
+            polyline.addVertices(pts);
+            polyline.close();
+            polyline = polyline.getResampledByCount(polyline.size()/2).getSmoothed(4);
+            polyline.scale(-2.625, 2.625); // Scale blobs according to screensize
+            kinectPolylines.push_back(polyline);
+        }
+        ofEnableBlendMode(OF_BLENDMODE_SCREEN);
+        ofSetColor(255, 10);
+        ofPushView();
+        ofTranslate(ofGetWidth(), 0);
+        for(int i=0; i<kinectPolylines.size(); i++){
+            kinectPolylines[i].draw();
+        }
+        ofPopView();
+        ofDisableBlendMode();
+    }
     fbo.end();
     
 }
 
 //--------------------------------------------------------------
 void ofApp::draw(){
+    ofSetColor(255, 255);
     fbo.draw(0, 0);
-    
-    grayImage.draw(0, 0, 640/3, 480/3);
-
 }
 
 //--------------------------------------------------------------
 void ofApp::keyPressed(int key){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::keyReleased(int key){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseMoved(int x, int y ){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseDragged(int x, int y, int button){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::mousePressed(int x, int y, int button){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseReleased(int x, int y, int button){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseEntered(int x, int y){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseExited(int x, int y){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::windowResized(int w, int h){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::gotMessage(ofMessage msg){
-
-}
-
-//--------------------------------------------------------------
-void ofApp::dragEvent(ofDragInfo dragInfo){ 
-
+    if(key == '1'){
+        MODE = 1;
+        ofLog() << "MODE 1";
+    }else if(key == '2'){
+        MODE = 2;
+        ofLog() << "MODE 2";
+    }
 }
